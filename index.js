@@ -1,4 +1,4 @@
-```javascript
+
 const TelegramBot = require("node-telegram-bot-api");
 const Anthropic = require("@anthropic-ai/sdk");
 
