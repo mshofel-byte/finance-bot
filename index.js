@@ -1,3 +1,4 @@
+```javascript
 const TelegramBot = require("node-telegram-bot-api");
 const Anthropic = require("@anthropic-ai/sdk");
 
@@ -34,25 +35,16 @@ const SYSTEM_PROMPT = `You MUST always respond in Hebrew only.
 כשפונים אליך, השתמש בכל מה ששמעת כדי לענות בצורה מדויקת ומועילה.
 ענה תמיד בעברית. היה מקצועי וממוקד.`;
 
-const MAIN_MENU = {
+const PERSISTENT_KEYBOARD = {
   reply_markup: {
-    inline_keyboard: [
-      [
-        { text: "🏗️ Rezidence Kolín", callback_data: "company_kolin" },
-        { text: "🏢 EDGON", callback_data: "company_edgon" },
-      ],
-      [
-        { text: "🏘️ CBRMY", callback_data: "company_cbrmy" },
-        { text: "🌳 BESIATA", callback_data: "company_besiata" },
-      ],
-      [
-        { text: "🏙️ BEEZRATO", callback_data: "company_beezrato" },
-        { text: "🤝 Osterhauer", callback_data: "company_osterhauer" },
-      ],
-      [
-        { text: "🏛️ Czech-Israel Holding", callback_data: "company_holding" },
-      ],
+    keyboard: [
+      ["🏗️ Rezidence Kolín", "🏢 EDGON"],
+      ["🏘️ CBRMY", "🌳 BESIATA"],
+      ["🏙️ BEEZRATO", "🤝 Osterhauer"],
+      ["🏛️ Czech-Israel Holding", "📋 תפריט"],
     ],
+    resize_keyboard: true,
+    persistent: true,
   },
 };
 
@@ -68,11 +60,31 @@ function getCompanyMenu(companyKey) {
           { text: "📅 לוח זמנים", callback_data: `${companyKey}_timeline` },
           { text: "👥 אנשי קשר", callback_data: `${companyKey}_contacts` },
         ],
-        [{ text: "🔙 חזרה לתפריט", callback_data: "main_menu" }],
+        [{ text: "🔙 חזרה", callback_data: "main_menu" }],
       ],
     },
   };
 }
+
+const INLINE_MAIN_MENU = {
+  reply_markup: {
+    inline_keyboard: [
+      [
+        { text: "🏗️ Rezidence Kolín", callback_data: "company_kolin" },
+        { text: "🏢 EDGON", callback_data: "company_edgon" },
+      ],
+      [
+        { text: "🏘️ CBRMY", callback_data: "company_cbrmy" },
+        { text: "🌳 BESIATA", callback_data: "company_besiata" },
+      ],
+      [
+        { text: "🏙️ BEEZRATO", callback_data: "company_beezrato" },
+        { text: "🤝 Osterhauer", callback_data: "company_osterhauer" },
+      ],
+      [{ text: "🏛️ Czech-Israel Holding", callback_data: "company_holding" }],
+    ],
+  },
+};
 
 const COMPANY_INFO = {
   company_kolin: {
@@ -105,6 +117,16 @@ const COMPANY_INFO = {
   },
 };
 
+const KEYBOARD_TO_COMPANY = {
+  "🏗️ Rezidence Kolín": "company_kolin",
+  "🏢 EDGON": "company_edgon",
+  "🏘️ CBRMY": "company_cbrmy",
+  "🌳 BESIATA": "company_besiata",
+  "🏙️ BEEZRATO": "company_beezrato",
+  "🤝 Osterhauer": "company_osterhauer",
+  "🏛️ Czech-Israel Holding": "company_holding",
+};
+
 function saveToMemory(chatId, senderName, text) {
   if (!groupMemory[chatId]) groupMemory[chatId] = [];
   const timestamp = new Date().toLocaleString("he-IL", { timeZone: "Asia/Jerusalem" });
@@ -133,13 +155,38 @@ function getSenderName(msg) {
   return `${msg.from?.first_name || ""} ${msg.from?.last_name || ""}`.trim() || "משתמש";
 }
 
+async function askClaude(chatId, prompt) {
+  if (!conversations[chatId]) conversations[chatId] = [];
+  const context = buildContext(chatId);
+  const userMessage = context ? `${prompt}\n\n(הקשר: ${context})` : prompt;
+  conversations[chatId].push({ role: "user", content: userMessage });
+
+  const response = await anthropic.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 1000,
+    system: SYSTEM_PROMPT,
+    messages: conversations[chatId],
+  });
+
+  const reply = response.content[0].text;
+  conversations[chatId].pop();
+  conversations[chatId].push({ role: "user", content: prompt });
+  conversations[chatId].push({ role: "assistant", content: reply });
+  if (conversations[chatId].length > 20) conversations[chatId] = conversations[chatId].slice(-20);
+  return reply;
+}
+
 bot.onText(/\/start/, (msg) => {
   conversations[msg.chat.id] = [];
-  bot.sendMessage(msg.chat.id, "שלום מנחם! אני הסוכן הפיננסי של Czech-Israel 🏢\nאני מקשיב לכל השיחות ואענה כשתפנה אליי.\n\nבמה אוכל לעזור?", MAIN_MENU);
+  bot.sendMessage(
+    msg.chat.id,
+    "שלום מנחם! אני הסוכן הפיננסי של Czech-Israel 🏢\nבחר חברה מהתפריט למטה או שאל אותי כל שאלה.",
+    PERSISTENT_KEYBOARD
+  );
 });
 
 bot.onText(/\/תפריט|\/menu/, (msg) => {
-  bot.sendMessage(msg.chat.id, "בחר חברה:", MAIN_MENU);
+  bot.sendMessage(msg.chat.id, "בחר חברה:", INLINE_MAIN_MENU);
 });
 
 bot.on("callback_query", async (query) => {
@@ -150,7 +197,7 @@ bot.on("callback_query", async (query) => {
     bot.editMessageText("בחר חברה:", {
       chat_id: chatId,
       message_id: query.message.message_id,
-      ...MAIN_MENU,
+      ...INLINE_MAIN_MENU,
     });
     bot.answerCallbackQuery(query.id);
     return;
@@ -171,39 +218,14 @@ bot.on("callback_query", async (query) => {
   const action = parts[parts.length - 1];
   const companyKey = parts.slice(0, -1).join("_");
   const companyName = COMPANY_INFO[companyKey]?.name || companyKey;
-
-  const actionMap = {
-    status: "סטטוס עדכני",
-    finance: "מצב פיננסי",
-    timeline: "לוח זמנים",
-    contacts: "אנשי קשר",
-  };
-
-  const actionText = actionMap[action] || action;
-  const prompt = `תן לי ${actionText} על ${companyName}`;
+  const actionMap = { status: "סטטוס עדכני", finance: "מצב פיננסי", timeline: "לוח זמנים", contacts: "אנשי קשר" };
+  const prompt = `תן לי ${actionMap[action] || action} על ${companyName}`;
 
   bot.answerCallbackQuery(query.id, { text: "מחפש מידע..." });
   bot.sendChatAction(chatId, "typing");
 
-  if (!conversations[chatId]) conversations[chatId] = [];
-  const context = buildContext(chatId);
-  const userMessage = context ? `${prompt}\n\n(הקשר: ${context})` : prompt;
-  conversations[chatId].push({ role: "user", content: userMessage });
-
   try {
-    const response = await anthropic.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 1000,
-      system: SYSTEM_PROMPT,
-      messages: conversations[chatId],
-    });
-
-    const reply = response.content[0].text;
-    conversations[chatId].pop();
-    conversations[chatId].push({ role: "user", content: prompt });
-    conversations[chatId].push({ role: "assistant", content: reply });
-    if (conversations[chatId].length > 20) conversations[chatId] = conversations[chatId].slice(-20);
-
+    const reply = await askClaude(chatId, prompt);
     bot.sendMessage(chatId, reply);
   } catch (err) {
     console.error("Error:", err.message);
@@ -220,32 +242,28 @@ bot.on("message", async (msg) => {
   const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
 
   if (isGroup) saveToMemory(chatId, senderName, text);
+
+  if (KEYBOARD_TO_COMPANY[text]) {
+    const companyKey = KEYBOARD_TO_COMPANY[text];
+    const company = COMPANY_INFO[companyKey];
+    bot.sendMessage(chatId, company.info, getCompanyMenu(companyKey));
+    return;
+  }
+
+  if (text === "📋 תפריט") {
+    bot.sendMessage(chatId, "בחר חברה:", INLINE_MAIN_MENU);
+    return;
+  }
+
   if (!shouldRespond(msg)) return;
 
   const cleanedText = cleanText(text);
   if (!cleanedText) return;
 
-  if (!conversations[chatId]) conversations[chatId] = [];
-  const context = buildContext(chatId);
-  const userMessage = context ? `${cleanedText}\n\n(הקשר: ${context})` : cleanedText;
-
-  conversations[chatId].push({ role: "user", content: userMessage });
   bot.sendChatAction(chatId, "typing");
 
   try {
-    const response = await anthropic.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 1000,
-      system: SYSTEM_PROMPT,
-      messages: conversations[chatId],
-    });
-
-    const reply = response.content[0].text;
-    conversations[chatId].pop();
-    conversations[chatId].push({ role: "user", content: cleanedText });
-    conversations[chatId].push({ role: "assistant", content: reply });
-    if (conversations[chatId].length > 20) conversations[chatId] = conversations[chatId].slice(-20);
-
+    const reply = await askClaude(chatId, cleanedText);
     bot.sendMessage(chatId, reply);
   } catch (err) {
     console.error("Error:", err.message);
@@ -254,3 +272,6 @@ bot.on("message", async (msg) => {
 });
 
 console.log("🏢 סוכן פיננסי Czech-Israel פועל!");
+```
+
+העתק ישירות מכאן ל-GitHub 🚀
