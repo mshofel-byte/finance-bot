@@ -1,5 +1,10 @@
 const TelegramBot = require("node-telegram-bot-api");
 const Anthropic = require("@anthropic-ai/sdk");
+const axios = require("axios");
+const XLSX = require("xlsx");
+const pdf = require("pdf-parse");
+const mammoth = require("mammoth");
+const path = require("path");
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
@@ -32,6 +37,7 @@ const SYSTEM_PROMPT = `You MUST always respond in Hebrew only.
 
 אתה מקשיב לכל השיחות בקבוצה ושומר את המידע בזיכרון.
 כשפונים אליך, השתמש בכל מה ששמעת כדי לענות בצורה מדויקת ומועילה.
+אתה יכול לקרוא ולנתח קבצים שמשלחים אליך.
 ענה תמיד בעברית. היה מקצועי וממוקד.`;
 
 const PERSISTENT_KEYBOARD = {
@@ -125,12 +131,61 @@ function shouldRespond(msg) {
   return mentionedBot || replyToBot;
 }
 
+function shouldRespondToFile(msg) {
+  if (msg.chat.type === "private") return true;
+  const caption = msg.caption || "";
+  const mentionedBot = botUsername && caption.toLowerCase().includes(`@${botUsername.toLowerCase()}`);
+  const replyToBot = msg.reply_to_message?.from?.username === botUsername;
+  return mentionedBot || replyToBot;
+}
+
 function cleanText(text) {
   return (text || "").replace(/@\S+/g, "").trim();
 }
 
 function getSenderName(msg) {
   return `${msg.from?.first_name || ""} ${msg.from?.last_name || ""}`.trim() || "משתמש";
+}
+
+async function downloadFile(fileId) {
+  const fileLink = await bot.getFileLink(fileId);
+  const response = await axios.get(fileLink, { responseType: "arraybuffer" });
+  return Buffer.from(response.data);
+}
+
+async function extractText(fileId, fileName, mimeType) {
+  const buffer = await downloadFile(fileId);
+  const ext = path.extname(fileName || "").toLowerCase();
+
+  if (ext === ".xlsx" || ext === ".xls" || mimeType?.includes("spreadsheet") || mimeType?.includes("excel")) {
+    const workbook = XLSX.read(buffer, { type: "buffer" });
+    let text = "";
+    workbook.SheetNames.forEach((sheet) => {
+      text += `\nגיליון: ${sheet}\n`;
+      text += XLSX.utils.sheet_to_csv(workbook.Sheets[sheet]);
+    });
+    return text;
+  }
+
+  if (ext === ".csv" || mimeType?.includes("csv")) {
+    return buffer.toString("utf-8");
+  }
+
+  if (ext === ".pdf" || mimeType?.includes("pdf")) {
+    const data = await pdf(buffer);
+    return data.text;
+  }
+
+  if (ext === ".docx" || mimeType?.includes("wordprocessingml") || mimeType?.includes("msword")) {
+    const result = await mammoth.extractRawText({ buffer });
+    return result.value;
+  }
+
+  if (ext === ".txt" || mimeType?.includes("text/plain")) {
+    return buffer.toString("utf-8");
+  }
+
+  return null;
 }
 
 async function askClaude(chatId, prompt) {
@@ -141,7 +196,7 @@ async function askClaude(chatId, prompt) {
 
   const response = await anthropic.messages.create({
     model: "claude-haiku-4-5-20251001",
-    max_tokens: 1000,
+    max_tokens: 2000,
     system: SYSTEM_PROMPT,
     messages: conversations[chatId],
   });
@@ -157,13 +212,37 @@ async function askClaude(chatId, prompt) {
 bot.onText(/\/start/, (msg) => {
   conversations[msg.chat.id] = [];
   bot.sendMessage(msg.chat.id,
-    "שלום מנחם! אני הסוכן הפיננסי של Czech-Israel 🏢\nבחר חברה מהתפריט למטה או שאל אותי כל שאלה.",
+    "שלום מנחם! אני הסוכן הפיננסי של Czech-Israel 🏢\n\nאני יכול:\n📂 לקרוא קבצים (Excel, PDF, Word, CSV)\n💬 לענות על שאלות\n\nבחר חברה מהתפריט למטה או שאל אותי כל שאלה.",
     PERSISTENT_KEYBOARD
   );
 });
 
 bot.onText(/\/תפריט|\/menu/, (msg) => {
   bot.sendMessage(msg.chat.id, "בחר חברה:", INLINE_MAIN_MENU);
+});
+
+bot.on("document", async (msg) => {
+  if (!shouldRespondToFile(msg)) return;
+  const doc = msg.document;
+  const chatId = msg.chat.id;
+  const caption = cleanText(msg.caption || "");
+
+  bot.sendChatAction(chatId, "typing");
+  try {
+    const text = await extractText(doc.file_id, doc.file_name, doc.mime_type);
+    if (text) {
+      const prompt = caption
+        ? `${caption}\n\nתוכן הקובץ "${doc.file_name}":\n${text.slice(0, 8000)}`
+        : `נתח את הקובץ "${doc.file_name}":\n${text.slice(0, 8000)}`;
+      const reply = await askClaude(chatId, prompt);
+      bot.sendMessage(chatId, reply);
+    } else {
+      bot.sendMessage(chatId, "סוג קובץ זה לא נתמך. נסה Excel, PDF, Word או CSV.");
+    }
+  } catch (err) {
+    console.error("File error:", err.message);
+    bot.sendMessage(chatId, "אופס, לא הצלחתי לקרוא את הקובץ 🙏");
+  }
 });
 
 bot.on("callback_query", async (query) => {
