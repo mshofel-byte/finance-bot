@@ -1,4 +1,3 @@
-
 const TelegramBot = require("node-telegram-bot-api");
 const Anthropic = require("@anthropic-ai/sdk");
 
@@ -272,6 +271,3 @@ bot.on("message", async (msg) => {
 });
 
 console.log("🏢 סוכן פיננסי Czech-Israel פועל!");
-```
-
-העתק ישירות מכאן ל-GitHub 🚀
