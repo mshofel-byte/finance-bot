@@ -21,12 +21,14 @@ const pool = new Pool({
 let botUsername = null;
 const conversations = {};
 
+const activeSessions = {};
+const SESSION_DURATION = 10 * 60 * 1000;
+
 bot.getMe().then((me) => {
   botUsername = me.username;
   console.log(`🤖 הבוט מחובר: @${botUsername}`);
 });
 
-// יצירת טבלת זיכרון משותף
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS shared_memory (
@@ -68,23 +70,22 @@ const SYSTEM_PROMPT = `You MUST always respond in Hebrew only.
 - Czech-Israel Holding s.r.o — חברת האם. בעלים: מנחם שופל ורון זבנר שי (50/50)
 - Czech-Israel s.r.o — מחזיקה 50% בפרויקט קולין
 - Rezidence Kolín s.r.o — 70 דירות + 1,200 מ"ר מסחר. בנייה צפויה אוגוסט 2025
-- CBRMY s.r.o — רוכשת את Edgon (30 דירות בצ'רניצ'ה)
+- CBRMY s.r.o — רוכשת ומוזגת את EDGON (30 דירות בצ'רניצ'ה)
 - BESIATA s.r.o — מגרש בקולין
 - BEEZRATO s.r.o — פרויקט מלדה בולסוב
-- EDGON a.s. — 2 בניינים בצ'רניצ'ה
 - Osterhauer — חברה משותפת מנחם ורוני
 
-יש לך גישה לזיכרון משותף — כל מה שנאמר בכל צ'אט (פרטי או קבוצה) שמור שם.
+יש לך גישה לזיכרון משותף — כל מה שנאמר בכל צ'אט שמור שם.
 השתמש בו כדי לענות בצורה מדויקת ומועילה.
 ענה תמיד בעברית. היה מקצועי וממוקד.`;
 
 const PERSISTENT_KEYBOARD = {
   reply_markup: {
     keyboard: [
-      ["🏗️ Rezidence Kolín", "🏢 EDGON"],
-      ["🏘️ CBRMY", "🌳 BESIATA"],
-      ["🏙️ BEEZRATO", "🤝 Osterhauer"],
-      ["🏛️ Czech-Israel Holding", "📋 תפריט"],
+      ["🏗️ Rezidence Kolín", "🏘️ CBRMY"],
+      ["🌳 BESIATA", "🏙️ BEEZRATO"],
+      ["🤝 Osterhauer", "🏛️ Czech-Israel Holding"],
+      ["📋 תפריט"],
     ],
     resize_keyboard: true,
     persistent: true,
@@ -114,25 +115,23 @@ const INLINE_MAIN_MENU = {
     inline_keyboard: [
       [
         { text: "🏗️ Rezidence Kolín", callback_data: "company_kolin" },
-        { text: "🏢 EDGON", callback_data: "company_edgon" },
-      ],
-      [
         { text: "🏘️ CBRMY", callback_data: "company_cbrmy" },
-        { text: "🌳 BESIATA", callback_data: "company_besiata" },
       ],
       [
+        { text: "🌳 BESIATA", callback_data: "company_besiata" },
         { text: "🏙️ BEEZRATO", callback_data: "company_beezrato" },
-        { text: "🤝 Osterhauer", callback_data: "company_osterhauer" },
       ],
-      [{ text: "🏛️ Czech-Israel Holding", callback_data: "company_holding" }],
+      [
+        { text: "🤝 Osterhauer", callback_data: "company_osterhauer" },
+        { text: "🏛️ Czech-Israel Holding", callback_data: "company_holding" },
+      ],
     ],
   },
 };
 
 const COMPANY_INFO = {
   company_kolin: { name: "Rezidence Kolín", info: "🏗️ Rezidence Kolín s.r.o\n\n70 דירות + 1,200 מ\"ר מסחר\nבנייה צפויה: אוגוסט 2025\nCzech-Israel מחזיקה 50%" },
-  company_edgon: { name: "EDGON", info: "🏢 EDGON a.s\n\n2 בניינים בצ'רניצ'ה\nנרכשת ע\"י CBRMY s.r.o" },
-  company_cbrmy: { name: "CBRMY", info: "🏘️ CBRMY s.r.o\n\nרוכשת את EDGON\n30 דירות בצ'רניצ'ה" },
+  company_cbrmy: { name: "CBRMY", info: "🏘️ CBRMY s.r.o\n\nרוכשת ומוזגת את EDGON\n30 דירות בצ'רניצ'ה" },
   company_besiata: { name: "BESIATA", info: "🌳 BESIATA s.r.o\n\nמגרש בקולין" },
   company_beezrato: { name: "BEEZRATO", info: "🏙️ BEEZRATO s.r.o\n\nפרויקט מלדה בולסוב" },
   company_osterhauer: { name: "Osterhauer", info: "🤝 Osterhauer\n\nחברה משותפת מנחם ורוני" },
@@ -141,7 +140,6 @@ const COMPANY_INFO = {
 
 const KEYBOARD_TO_COMPANY = {
   "🏗️ Rezidence Kolín": "company_kolin",
-  "🏢 EDGON": "company_edgon",
   "🏘️ CBRMY": "company_cbrmy",
   "🌳 BESIATA": "company_besiata",
   "🏙️ BEEZRATO": "company_beezrato",
@@ -149,19 +147,41 @@ const KEYBOARD_TO_COMPANY = {
   "🏛️ Czech-Israel Holding": "company_holding",
 };
 
-function shouldRespond(msg) {
-  if (msg.chat.type === "private") return true;
-  const mentionedBot = botUsername && msg.text && msg.text.toLowerCase().includes(`@${botUsername.toLowerCase()}`);
-  const replyToBot = msg.reply_to_message?.from?.username === botUsername;
-  return mentionedBot || replyToBot;
+function isSessionActive(chatId) {
+  const expiry = activeSessions[chatId];
+  if (!expiry) return false;
+  if (Date.now() > expiry) {
+    delete activeSessions[chatId];
+    return false;
+  }
+  return true;
 }
 
-function shouldRespondToFile(msg) {
+function activateSession(chatId) {
+  activeSessions[chatId] = Date.now() + SESSION_DURATION;
+}
+
+function shouldRespond(msg) {
   if (msg.chat.type === "private") return true;
-  const caption = msg.caption || "";
-  const mentionedBot = botUsername && caption.toLowerCase().includes(`@${botUsername.toLowerCase()}`);
+
+  const text = msg.text || msg.caption || "";
+  const mentionedBot = botUsername && (
+    text.toLowerCase().includes(`@${botUsername.toLowerCase()}`) ||
+    text.includes("קלוד")
+  );
   const replyToBot = msg.reply_to_message?.from?.username === botUsername;
-  return mentionedBot || replyToBot;
+
+  if (mentionedBot || replyToBot) {
+    activateSession(msg.chat.id);
+    return true;
+  }
+
+  if (isSessionActive(msg.chat.id)) {
+    activateSession(msg.chat.id);
+    return true;
+  }
+
+  return false;
 }
 
 function cleanText(text) {
@@ -229,7 +249,7 @@ async function askClaude(chatId, prompt) {
 bot.onText(/\/start/, (msg) => {
   conversations[msg.chat.id] = [];
   bot.sendMessage(msg.chat.id,
-    "שלום מנחם! אני הסוכן הפיננסי של Czech-Israel 🏢\n\nיש לי זיכרון משותף — מה שנאמר בפרטי ידוע בקבוצה ולהיפך.\n\nבחר חברה מהתפריט או שאל אותי כל שאלה.",
+    "שלום מנחם! אני הסוכן הפיננסי של Czech-Israel 🏢\n\nבקבוצה — כתוב 'קלוד' או תייג אותי פעם אחת ואני אענה לכל השיחה למשך 10 דקות.\n\nבחר חברה מהתפריט או שאל אותי כל שאלה.",
     PERSISTENT_KEYBOARD
   );
 });
@@ -239,7 +259,16 @@ bot.onText(/\/תפריט|\/menu/, (msg) => {
 });
 
 bot.on("document", async (msg) => {
-  if (!shouldRespondToFile(msg)) return;
+  const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
+  if (isGroup && !shouldRespond(msg)) {
+    const senderName = getSenderName(msg);
+    const caption = msg.caption || "";
+    try {
+      await saveToSharedMemory(`[קובץ] ${msg.document.file_name} ${caption ? `- ${caption}` : ""}`, senderName, msg.chat.type);
+    } catch (err) {}
+    return;
+  }
+
   const doc = msg.document;
   const chatId = msg.chat.id;
   const caption = cleanText(msg.caption || "");
@@ -249,7 +278,7 @@ bot.on("document", async (msg) => {
   try {
     const text = await extractText(doc.file_id, doc.file_name, doc.mime_type);
     if (text) {
-      const summary = `קובץ "${doc.file_name}" נשלח ע"י ${senderName}:\n${text.slice(0, 500)}...`;
+      const summary = `קובץ "${doc.file_name}" נשלח ע"י ${senderName}:\n${text.slice(0, 500)}`;
       await saveToSharedMemory(summary, senderName, msg.chat.type);
       const prompt = caption
         ? `${caption}\n\nתוכן הקובץ "${doc.file_name}":\n${text.slice(0, 8000)}`
@@ -306,7 +335,6 @@ bot.on("message", async (msg) => {
   const senderName = getSenderName(msg);
   const chatType = msg.chat.type;
 
-  // שמור הכל בזיכרון משותף
   try {
     await saveToSharedMemory(text, senderName, chatType);
   } catch (err) {
