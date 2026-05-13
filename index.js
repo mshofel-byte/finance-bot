@@ -4,6 +4,7 @@ const axios = require("axios");
 const XLSX = require("xlsx");
 const pdf = require("pdf-parse");
 const mammoth = require("mammoth");
+const { Pool } = require("pg");
 const path = require("path");
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
@@ -12,14 +13,52 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
 let botUsername = null;
-const groupMemory = {};
 const conversations = {};
 
 bot.getMe().then((me) => {
   botUsername = me.username;
   console.log(`🤖 הבוט מחובר: @${botUsername}`);
 });
+
+// יצירת טבלת זיכרון משותף
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shared_memory (
+      id SERIAL PRIMARY KEY,
+      content TEXT NOT NULL,
+      sender_name TEXT,
+      chat_type TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  console.log("✅ מסד נתונים מוכן");
+}
+initDB();
+
+async function saveToSharedMemory(content, senderName, chatType) {
+  await pool.query(
+    "INSERT INTO shared_memory (content, sender_name, chat_type) VALUES ($1, $2, $3)",
+    [content, senderName, chatType]
+  );
+}
+
+async function getSharedMemory() {
+  const result = await pool.query(
+    "SELECT sender_name, content, created_at FROM shared_memory ORDER BY created_at DESC LIMIT 100"
+  );
+  if (result.rows.length === 0) return "";
+  const lines = result.rows.reverse().map((r) => {
+    const time = new Date(r.created_at).toLocaleString("he-IL", { timeZone: "Asia/Jerusalem" });
+    return `[${time}] ${r.sender_name}: ${r.content}`;
+  });
+  return `\n\n--- זיכרון משותף ---\n${lines.join("\n")}\n--- סוף זיכרון ---\n`;
+}
 
 const SYSTEM_PROMPT = `You MUST always respond in Hebrew only.
 
@@ -35,9 +74,8 @@ const SYSTEM_PROMPT = `You MUST always respond in Hebrew only.
 - EDGON a.s. — 2 בניינים בצ'רניצ'ה
 - Osterhauer — חברה משותפת מנחם ורוני
 
-אתה מקשיב לכל השיחות בקבוצה ושומר את המידע בזיכרון.
-כשפונים אליך, השתמש בכל מה ששמעת כדי לענות בצורה מדויקת ומועילה.
-אתה יכול לקרוא ולנתח קבצים שמשלחים אליך.
+יש לך גישה לזיכרון משותף — כל מה שנאמר בכל צ'אט (פרטי או קבוצה) שמור שם.
+השתמש בו כדי לענות בצורה מדויקת ומועילה.
 ענה תמיד בעברית. היה מקצועי וממוקד.`;
 
 const PERSISTENT_KEYBOARD = {
@@ -111,19 +149,6 @@ const KEYBOARD_TO_COMPANY = {
   "🏛️ Czech-Israel Holding": "company_holding",
 };
 
-function saveToMemory(chatId, senderName, text) {
-  if (!groupMemory[chatId]) groupMemory[chatId] = [];
-  const timestamp = new Date().toLocaleString("he-IL", { timeZone: "Asia/Jerusalem" });
-  groupMemory[chatId].push(`[${timestamp}] ${senderName}: ${text}`);
-  if (groupMemory[chatId].length > 200) groupMemory[chatId] = groupMemory[chatId].slice(-200);
-}
-
-function buildContext(chatId) {
-  if (!groupMemory[chatId] || groupMemory[chatId].length === 0) return "";
-  const recent = groupMemory[chatId].slice(-50);
-  return `\n\n--- היסטוריית השיחה בקבוצה ---\n${recent.join("\n")}\n--- סוף היסטוריה ---\n`;
-}
-
 function shouldRespond(msg) {
   if (msg.chat.type === "private") return true;
   const mentionedBot = botUsername && msg.text && msg.text.toLowerCase().includes(`@${botUsername.toLowerCase()}`);
@@ -166,32 +191,24 @@ async function extractText(fileId, fileName, mimeType) {
     });
     return text;
   }
-
-  if (ext === ".csv" || mimeType?.includes("csv")) {
-    return buffer.toString("utf-8");
-  }
-
+  if (ext === ".csv") return buffer.toString("utf-8");
   if (ext === ".pdf" || mimeType?.includes("pdf")) {
     const data = await pdf(buffer);
     return data.text;
   }
-
-  if (ext === ".docx" || mimeType?.includes("wordprocessingml") || mimeType?.includes("msword")) {
+  if (ext === ".docx" || mimeType?.includes("wordprocessingml")) {
     const result = await mammoth.extractRawText({ buffer });
     return result.value;
   }
-
-  if (ext === ".txt" || mimeType?.includes("text/plain")) {
-    return buffer.toString("utf-8");
-  }
-
+  if (ext === ".txt") return buffer.toString("utf-8");
   return null;
 }
 
 async function askClaude(chatId, prompt) {
   if (!conversations[chatId]) conversations[chatId] = [];
-  const context = buildContext(chatId);
-  const userMessage = context ? `${prompt}\n\n(הקשר: ${context})` : prompt;
+  const memory = await getSharedMemory();
+  const userMessage = memory ? `${prompt}\n\n(${memory})` : prompt;
+
   conversations[chatId].push({ role: "user", content: userMessage });
 
   const response = await anthropic.messages.create({
@@ -212,7 +229,7 @@ async function askClaude(chatId, prompt) {
 bot.onText(/\/start/, (msg) => {
   conversations[msg.chat.id] = [];
   bot.sendMessage(msg.chat.id,
-    "שלום מנחם! אני הסוכן הפיננסי של Czech-Israel 🏢\n\nאני יכול:\n📂 לקרוא קבצים (Excel, PDF, Word, CSV)\n💬 לענות על שאלות\n\nבחר חברה מהתפריט למטה או שאל אותי כל שאלה.",
+    "שלום מנחם! אני הסוכן הפיננסי של Czech-Israel 🏢\n\nיש לי זיכרון משותף — מה שנאמר בפרטי ידוע בקבוצה ולהיפך.\n\nבחר חברה מהתפריט או שאל אותי כל שאלה.",
     PERSISTENT_KEYBOARD
   );
 });
@@ -226,11 +243,14 @@ bot.on("document", async (msg) => {
   const doc = msg.document;
   const chatId = msg.chat.id;
   const caption = cleanText(msg.caption || "");
+  const senderName = getSenderName(msg);
 
   bot.sendChatAction(chatId, "typing");
   try {
     const text = await extractText(doc.file_id, doc.file_name, doc.mime_type);
     if (text) {
+      const summary = `קובץ "${doc.file_name}" נשלח ע"י ${senderName}:\n${text.slice(0, 500)}...`;
+      await saveToSharedMemory(summary, senderName, msg.chat.type);
       const prompt = caption
         ? `${caption}\n\nתוכן הקובץ "${doc.file_name}":\n${text.slice(0, 8000)}`
         : `נתח את הקובץ "${doc.file_name}":\n${text.slice(0, 8000)}`;
@@ -270,7 +290,6 @@ bot.on("callback_query", async (query) => {
 
   bot.answerCallbackQuery(query.id, { text: "מחפש מידע..." });
   bot.sendChatAction(chatId, "typing");
-
   try {
     const reply = await askClaude(chatId, prompt);
     bot.sendMessage(chatId, reply);
@@ -285,9 +304,14 @@ bot.on("message", async (msg) => {
   if (!text || text.startsWith("/")) return;
 
   const senderName = getSenderName(msg);
-  const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
+  const chatType = msg.chat.type;
 
-  if (isGroup) saveToMemory(chatId, senderName, text);
+  // שמור הכל בזיכרון משותף
+  try {
+    await saveToSharedMemory(text, senderName, chatType);
+  } catch (err) {
+    console.error("Memory error:", err.message);
+  }
 
   if (KEYBOARD_TO_COMPANY[text]) {
     bot.sendMessage(chatId, COMPANY_INFO[KEYBOARD_TO_COMPANY[text]].info, getCompanyMenu(KEYBOARD_TO_COMPANY[text]));
@@ -309,6 +333,7 @@ bot.on("message", async (msg) => {
     const reply = await askClaude(chatId, cleanedText);
     bot.sendMessage(chatId, reply);
   } catch (err) {
+    console.error("Error:", err.message);
     bot.sendMessage(chatId, "אופס, נתקלתי בבעיה. נסה שוב 🙏");
   }
 });
